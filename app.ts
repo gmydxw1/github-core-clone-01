@@ -64,7 +64,7 @@ function hashObject(type: GitType, data: Buffer): string {
 }
 function putObject(repo: Repo, type: GitType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) { repo.objects.set(oid, { type, data }); invalidatePackCache(repo); }
   return oid;
 }
 interface TreeEntry { mode: string; name: string; oid: string; }
@@ -389,6 +389,56 @@ function writePack(objects: Iterable<GitObj>): Buffer {
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
   return Buffer.concat([body, trailer]);
+}
+
+// ---------------------------------------------------------------- fetch pack cache
+// One upload-pack fetch is fully determined by (repo objects, wants, depth, haves,
+// shallow boundaries): collectFetch only reads repo.objects, and writePack's sort is
+// deterministic (hashObject). The clone workload issues 50 concurrent depth-1 clones
+// of the same tip, i.e. 50 identical fetches, so the first fetch builds the pack and
+// the rest reuse it. The entry keeps the pack plus the two small pieces of framing
+// metadata the fetch also produces (shallow list, commit depths for unshallow), so a
+// hit skips both collectFetch and writePack; the sideband framing is still built
+// per request. Keyed by Repo object identity (WeakMap), so deleting and recreating
+// a repo under the same name starts with an empty cache, and ref-only changes
+// cannot stale an entry because refs never enter the pack computation.
+interface PackCacheEntry { pack: Buffer; shallow: string[]; commits: Map<string, number>; }
+const packCache = new WeakMap<Repo, Map<string, PackCacheEntry>>();
+const PACK_CACHE_MAX_ENTRIES = 200;
+const PACK_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+let packCacheEntries = 0;
+let packCacheBytes = 0;
+const packCacheOrder: Array<{ repo: Repo; key: string }> = [];
+function packCacheKey(wants: string[], depth: number | null, haves: string[], shallowIn: string[]): string {
+  return [...wants].sort().join(',') + '\n' + (depth === null ? '' : String(depth)) + '\n' + [...haves].sort().join(',') + '\n' + [...shallowIn].sort().join(',');
+}
+function packCacheGet(repo: Repo, key: string): PackCacheEntry | undefined {
+  return packCache.get(repo)?.get(key);
+}
+function packCachePut(repo: Repo, key: string, entry: PackCacheEntry): void {
+  let per = packCache.get(repo);
+  if (!per) { per = new Map(); packCache.set(repo, per); }
+  const old = per.get(key);
+  if (old) packCacheBytes -= old.pack.length;
+  else { packCacheEntries++; packCacheOrder.push({ repo, key }); }
+  per.set(key, entry);
+  packCacheBytes += entry.pack.length;
+  while (packCacheEntries > PACK_CACHE_MAX_ENTRIES || packCacheBytes > PACK_CACHE_MAX_BYTES) {
+    const victim = packCacheOrder.shift();
+    if (!victim) break;
+    const vmap = packCache.get(victim.repo);
+    const vent = vmap?.get(victim.key);
+    if (!vent) continue;
+    vmap!.delete(victim.key);
+    packCacheEntries--;
+    packCacheBytes -= vent.pack.length;
+  }
+}
+function invalidatePackCache(repo: Repo): void {
+  const per = packCache.get(repo);
+  if (!per) return;
+  for (const entry of per.values()) { packCacheBytes -= entry.pack.length; packCacheEntries--; }
+  per.clear();
 }
 
 // ---------------------------------------------------------------- ids + JSON shapes
@@ -1601,6 +1651,18 @@ function sidebandPack(pack: Buffer): Buffer {
   if (pack.length === 0) parts.push(pktLine(Buffer.from([1])));
   return Buffer.concat(parts);
 }
+function fetchPack(repo: Repo, wants: string[], depth: number | null, haves: string[], shallowIn: string[]): { pack: Buffer; shallow: string[]; commits: Map<string, number> } {
+  const key = packCacheKey(wants, depth, haves, shallowIn);
+  const cached = packCacheGet(repo, key);
+  if (cached) return cached;
+  const stopSet = new Set(shallowIn);
+  const haveSet = collectHave(repo, haves, stopSet);
+  const { objects, commits, shallow } = collectFetch(repo, wants, depth, stopSet, haveSet);
+  const pack = writePack([...objects.values()].sort((a, b) => (hashObject(a.type, a.data) < hashObject(b.type, b.data) ? -1 : 1)));
+  const entry: PackCacheEntry = { pack, shallow, commits };
+  packCachePut(repo, key, entry);
+  return entry;
+}
 function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string, bodyBuf: Buffer): void {
   const repo = findRepo(owner, repoName);
   if (!repo) { errJson(res, 404, 'Not Found'); return; }
@@ -1647,9 +1709,7 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: stri
         else if (l.startsWith('shallow ')) shallowIn.push(l.slice(8).trim());
         else if (l.startsWith('deepen ')) depth = Number(l.slice(7).trim());
       }
-      const stopSet = new Set(shallowIn);
-      const haveSet = collectHave(repo, haves, stopSet);
-      const { objects, commits, shallow } = collectFetch(repo, wants, depth, stopSet, haveSet);
+      const { pack, commits, shallow } = fetchPack(repo, wants, depth, haves, shallowIn);
       const unshallow: string[] = [];
       if (depth !== null) {
         for (const b of shallowIn) {
@@ -1657,7 +1717,6 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: stri
           if (d !== undefined && d < depth - 1) unshallow.push(b);
         }
       }
-      const pack = writePack([...objects.values()].sort((a, b) => (hashObject(a.type, a.data) < hashObject(b.type, b.data) ? -1 : 1)));
       const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_DELIM, pktLine('shallow-info\n')];
       for (const s of shallow) parts.push(pktLine(`shallow ${s}\n`));
       for (const u of unshallow) parts.push(pktLine(`unshallow ${u}\n`));
@@ -1681,12 +1740,9 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: stri
     else if (l === '') seenFlush = true;
   }
   void seenFlush;
-  const stopSet = new Set(shallowIn);
-  const haveSet = collectHave(repo, haves, stopSet);
-  const { objects, commits, shallow } = collectFetch(repo, wants, depth, stopSet, haveSet);
+  const { pack, commits, shallow } = fetchPack(repo, wants, depth, haves, shallowIn);
   const unshallow: string[] = [];
   if (depth !== null) for (const b of shallowIn) { const d = commits.get(b); if (d !== undefined && d < depth - 1) unshallow.push(b); }
-  const pack = writePack([...objects.values()].sort((a, b) => (hashObject(a.type, a.data) < hashObject(b.type, b.data) ? -1 : 1)));
   const parts: Buffer[] = [pktLine('NAK\n')];
   for (const s of shallow) parts.push(pktLine(`shallow ${s}\n`));
   for (const u of unshallow) parts.push(pktLine(`unshallow ${u}\n`));
@@ -1715,7 +1771,9 @@ function handleReceivePack(req: IncomingMessage, res: ServerResponse, owner: str
   if (rest.length > 0) {
     try {
       newObjects = readPack(rest, (oid) => repo.objects.get(oid));
-      for (const [oid, obj] of newObjects) repo.objects.set(oid, obj);
+      let added = false;
+      for (const [oid, obj] of newObjects) { if (!repo.objects.has(oid)) added = true; repo.objects.set(oid, obj); }
+      if (added) invalidatePackCache(repo);
     } catch (e) {
       unpackOk = false;
       unpackDetail = e instanceof Error ? e.message : 'unpack error';
