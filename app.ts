@@ -666,11 +666,13 @@ function peeledOid(repo: Repo, oid: string): string | undefined {
 // ---------------------------------------------------------------- HTTP helpers
 function reqId(): string { return `req-${++reqCounter}`; }
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
-  const text = status === 204 ? '' : `${JSON.stringify(body)}\n`;
+  // Build the response as one Buffer: its length is the Content-Length, so
+  // neither Buffer.byteLength nor res.end's re-encode scans the text again.
+  const buf = status === 204 ? null : Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   const headers: Record<string, string> = { 'content-type': JSON_TYPE, 'x-github-request-id': reqId(), ...extra };
-  if (status !== 204) headers['content-length'] = String(Buffer.byteLength(text));
+  if (buf !== null) headers['content-length'] = String(buf.length);
   res.writeHead(status, headers);
-  res.end(text);
+  res.end(buf ?? undefined);
 }
 function sendBuffer(res: ServerResponse, status: number, buf: Buffer, contentType: string, extra: Record<string, string> = {}): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': String(buf.length), 'x-github-request-id': reqId(), ...extra });
