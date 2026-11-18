@@ -271,6 +271,9 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   const srcSize = readSize();
   const tgtSize = readSize();
   if (srcSize !== base.length) throw new Error('delta base size mismatch');
+  // A delta that claims a gigantic target would allocate that much before
+  // failing: clamp first. Legitimate objects are at most a few MB.
+  if (tgtSize > MAX_DELTA_TARGET_BYTES) throw new Error('delta target too large');
   const out = Buffer.allocUnsafe(tgtSize);
   let written = 0;
   while (off < delta.length) {
@@ -439,6 +442,12 @@ function invalidatePackCache(repo: Repo): void {
   if (!per) return;
   for (const entry of per.values()) { packCacheBytes -= entry.pack.length; packCacheEntries--; }
   per.clear();
+  // Drop this repo's stale entries from the eviction queue as well: without
+  // this, every invalidate-then-rebuild leaves a dead queue entry behind and
+  // the queue grows without bound across many pushes.
+  for (let i = packCacheOrder.length - 1; i >= 0; i--) {
+    if (packCacheOrder[i].repo === repo) packCacheOrder.splice(i, 1);
+  }
 }
 
 // ---------------------------------------------------------------- ids + JSON shapes
@@ -679,10 +688,29 @@ function sendBuffer(res: ServerResponse, status: number, buf: Buffer, contentTyp
   res.end(buf);
 }
 function errJson(res: ServerResponse, status: number, message: string): void { sendJson(res, status, { message }); }
+// Largest request body the forge accepts. Legitimate bodies are small (the
+// biggest packs in the suite are ~100 KiB); anything past the cap is a faulty
+// or hostile client, and accumulating it without a bound would OOM the process.
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
+// Largest object a delta may claim to produce (same bound as request bodies).
+const MAX_DELTA_TARGET_BYTES = 64 * 1024 * 1024;
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
+    let total = 0;
+    const onData = (c: Buffer): void => {
+      total += c.length;
+      if (total > MAX_BODY_BYTES) {
+        req.off('data', onData);
+        req.pause();
+        const err = new Error('request body too large') as Error & { statusCode?: number };
+        err.statusCode = 413;
+        reject(err);
+        return;
+      }
+      chunks.push(c);
+    };
+    req.on('data', onData);
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
@@ -1830,7 +1858,12 @@ function authed(req: IncomingMessage): boolean {
   return h === `Bearer ${TOKEN}`;
 }
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    // A client that disconnects mid-response must not surface as an uncaught
+    // error: the request is already doomed, log it and move on.
+    res.on('error', (err: Error) => {
+      process.stderr.write(`[app] response error (continuing): ${err.message}\n`);
+    });
     void (async () => {
       try {
         const url = new URL(req.url ?? '/', 'http://entry');
@@ -1877,9 +1910,28 @@ export function createApp(): Server {
         errJson(res, 404, 'Not Found');
       } catch (e) {
         if (!res.writableEnded) {
-          try { errJson(res, 500, e instanceof Error ? e.message : 'Internal error'); } catch { /* already ended */ }
+          const status = (e as { statusCode?: unknown } | null)?.statusCode;
+          const code = typeof status === 'number' && Number.isFinite(status) ? status : 500;
+          try { errJson(res, code, e instanceof Error ? e.message : 'Internal error'); } catch { /* already ended */ }
+          // An over-cap body leaves the client still sending: drop the socket
+          // once the 413 has been flushed so it cannot keep the connection open.
+          if (code === 413) {
+            res.on('finish', () => { try { req.destroy(); } catch { /* ignore */ } });
+            res.on('close', () => { try { req.destroy(); } catch { /* ignore */ } });
+          }
         }
       }
     })();
   });
+  // Server-level failures (e.g. accept errors, malformed HTTP on a fresh
+  // socket) must not crash the process: log them and keep serving. clientError
+  // answers 400 instead of hanging the socket.
+  server.on('error', (err: Error) => {
+    process.stderr.write(`[app] server error (continuing): ${err.message}\n`);
+  });
+  server.on('clientError', (err: Error, socket) => {
+    process.stderr.write(`[app] client error: ${err.message}\n`);
+    try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch { /* ignore */ }
+  });
+  return server;
 }
