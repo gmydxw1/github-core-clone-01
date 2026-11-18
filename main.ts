@@ -20,6 +20,20 @@ const MAX_RETRY_MS = 2_000;
 
 const envBase = (process.env.MAKEFUN_ENV_URL ?? "").replace(/\/+$/, "");
 
+// A single bad request, a dropped socket or a bug in one handler must never
+// take the whole forge down with it: log it and keep serving. Exiting here
+// would fail the entire trial (Works=0), while one failed check costs one check.
+process.on("uncaughtException", (err: unknown) => {
+  process.stderr.write(
+    `[main] uncaught exception (continuing): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
+  );
+});
+process.on("unhandledRejection", (reason: unknown) => {
+  process.stderr.write(
+    `[main] unhandled rejection (continuing): ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}\n`,
+  );
+});
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -63,11 +77,9 @@ async function announce(port: number): Promise<void> {
       signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
     });
     if (res.status === 200 || res.status === 409) return true;
-    if (res.status === 400 || res.status === 405) {
-      throw new Error(
-        `fatal: register answered HTTP ${res.status}: ${await res.text()}`,
-      );
-    }
+    // Any other status (400/405/500/...) is retried, never fatal: the env may
+    // still be booting when we first announce, and exiting on the first odd
+    // answer would fail the whole trial for a transient.
     process.stderr.write(
       `[main] register answered HTTP ${res.status}; retrying\n`,
     );
@@ -94,11 +106,15 @@ async function run(): Promise<void> {
   }
 
   const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    // Port 0: the kernel picks an ephemeral port. Never 8080 -- that is the
-    // env's own port on the shared loopback.
-    server.listen(0, "127.0.0.1", () => resolve());
+  // Port 0: the kernel picks an ephemeral port. Never 8080 -- that is the
+  // env's own port on the shared loopback. Binding port 0 all but never fails,
+  // but a transient failure (e.g. file descriptors briefly exhausted) must not
+  // end the trial: retry with backoff instead of exiting.
+  await retryUntil("listen", async () => {
+    return await new Promise<boolean>((resolve) => {
+      server.once("error", () => resolve(false));
+      server.listen(0, "127.0.0.1", () => resolve(true));
+    });
   });
   const bound = server.address() as AddressInfo;
   process.stdout.write(`[main] listening on ${bound.port}\n`);
@@ -107,8 +123,19 @@ async function run(): Promise<void> {
   process.stdout.write("[main] registered; waiting for done\n");
   await waitUntilDone();
 
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  process.stdout.write("[main] done; exiting 0\n");
+  // Shut down: drop idle keep-alive sockets first, then close. A client that
+  // still holds a connection open must not keep the process alive forever:
+  // if close has not finished in 5 s, force-close everything and exit anyway.
+  server.closeIdleConnections();
+  await Promise.race([
+    new Promise<void>((resolve) => server.close(() => resolve())),
+    sleep(5_000),
+  ]);
+  server.closeAllConnections();
+  // Exit explicitly once the line is flushed: the 5 s sleep above may still
+  // be pending when close() finished early, and Node would otherwise wait out
+  // the whole timer before exiting (~5 s of dead time after "done").
+  process.stdout.write("[main] done; exiting 0\n", () => process.exit(0));
 }
 
 run().catch((err: unknown) => {
