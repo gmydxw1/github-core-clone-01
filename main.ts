@@ -107,13 +107,16 @@ async function run(): Promise<void> {
 
   const server = createApp();
   // Port 0: the kernel picks an ephemeral port. Never 8080 -- that is the
-  // env's own port on the shared loopback. Binding port 0 all but never fails,
-  // but a transient failure (e.g. file descriptors briefly exhausted) must not
-  // end the trial: retry with backoff instead of exiting.
+  // env's own port. Bind all interfaces (no host argument): the env dials the
+  // address our register request came from, which on a split trial network is
+  // this container's own IP, not loopback -- a 127.0.0.1-only listener would
+  // refuse it and fail boot. Binding port 0 all but never fails, but a
+  // transient failure (e.g. file descriptors briefly exhausted) must not end
+  // the trial: retry with backoff instead of exiting.
   await retryUntil("listen", async () => {
     return await new Promise<boolean>((resolve) => {
       server.once("error", () => resolve(false));
-      server.listen(0, "127.0.0.1", () => resolve(true));
+      server.listen(0, () => resolve(true));
     });
   });
   const bound = server.address() as AddressInfo;
